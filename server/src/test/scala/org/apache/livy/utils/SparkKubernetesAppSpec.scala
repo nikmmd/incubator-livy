@@ -17,13 +17,11 @@
 package org.apache.livy.utils
 
 import java.util.Objects._
-
 import io.fabric8.kubernetes.api.model._
 import io.fabric8.kubernetes.api.model.extensions.{Ingress, IngressRule, IngressSpec}
-import org.mockito.Mockito.when
+import org.mockito.Mockito.{spy, when}
 import org.scalatest.FunSpec
 import org.scalatest.mock.MockitoSugar._
-
 import org.apache.livy.{LivyBaseUnitTestSuite, LivyConf}
 
 class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
@@ -35,11 +33,11 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       val status = when(mock[PodStatus].getPhase).thenReturn("Status").getMock[PodStatus]
       val driver = when(mock[Pod].getStatus).thenReturn(status).getMock[Pod]
       assertResult("status") {
-        KubernetesAppReport(Option(driver), Seq.empty, IndexedSeq.empty, None, new LivyConf(false))
+        KubernetesAppReport(Option(driver), Seq.empty, IndexedSeq.empty, Left(None), new LivyConf(false))
           .getApplicationState
       }
       assertResult("unknown") {
-        KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, None, new LivyConf(false))
+        KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, Left(None), new LivyConf(false))
           .getApplicationState
       }
     }
@@ -64,7 +62,7 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       def test(labelExists: Boolean, lokiEnabled: Boolean, shouldBeDefined: Boolean): Unit =
         assertResult(shouldBeDefined) {
           KubernetesAppReport(
-            driverMock(labelExists), Seq.empty, IndexedSeq.empty, None, livyConf(lokiEnabled)
+            driverMock(labelExists), Seq.empty, IndexedSeq.empty, Left(None), livyConf(lokiEnabled)
           ).getDriverLogUrl.isDefined
         }
 
@@ -72,7 +70,7 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       test(labelExists = false, lokiEnabled = true, shouldBeDefined = false)
       test(labelExists = true, lokiEnabled = false, shouldBeDefined = false)
       test(labelExists = true, lokiEnabled = true, shouldBeDefined = true)
-      assert(KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, None, livyConf(true))
+      assert(KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, Left(None), livyConf(true))
         .getDriverLogUrl.isEmpty)
     }
 
@@ -90,7 +88,7 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       def test(labelExists: Boolean, lokiEnabled: Boolean, shouldBeDefined: Boolean): Unit =
         assertResult(shouldBeDefined) {
           KubernetesAppReport(
-            None, Seq(executorMock(labelExists).get), IndexedSeq.empty, None, livyConf(lokiEnabled)
+            None, Seq(executorMock(labelExists).get), IndexedSeq.empty, Left(None), livyConf(lokiEnabled)
           ).getExecutorsLogUrls.isDefined
         }
 
@@ -98,9 +96,47 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       test(labelExists = false, lokiEnabled = true, shouldBeDefined = false)
       test(labelExists = true, lokiEnabled = false, shouldBeDefined = false)
       test(labelExists = true, lokiEnabled = true, shouldBeDefined = true)
-      assert(KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, None, livyConf(true))
+      assert(KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, Left(None), livyConf(true))
         .getExecutorsLogUrls.isEmpty)
     }
+
+    it("should return driver svc endpoint when ingress is false"){
+
+      val svcName = "spark-app-123-driver-ui"
+      val namespace = "test"
+
+      //Spark Kubernetes deploys a service, so we bind to that
+
+      def serviceMock(): Some[Service] = {
+        val ms: Service = spy(new Service())
+       when(ms.getMetadata).thenReturn(
+          new ObjectMetaBuilder()
+            .withName(svcName)
+            .withNamespace(namespace)
+            .build()
+        )
+
+       when(ms.getSpec).thenReturn(new ServiceSpecBuilder()
+          .withPorts(new ServicePortBuilder()
+            .withName("spark-ui")
+            .withPort(4040)
+            .withTargetPort(new IntOrString(4040))
+            .build())
+          .build())
+
+          Some(ms)
+      }
+
+      val conf = new LivyConf()
+
+      val appReport = new KubernetesAppReport(None, Seq.empty, IndexedSeq.empty, Right(serviceMock()), conf)
+
+      assert(appReport.getTrackingUrl.isDefined)
+
+      assert(appReport.getTrackingUrl.get == s"http://${svcName}.${namespace}.svc.cluster.local:4040")
+
+    }
+
 
     it("should return driver ingress url") {
 
@@ -121,7 +157,7 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
       def test(driver: Option[Pod], ingress: Option[Ingress],
                protocol: Option[String], shouldBeDefined: Boolean): Unit = {
         assertResult(shouldBeDefined) {
-          KubernetesAppReport(driver, Seq.empty, IndexedSeq.empty, ingress, livyConf(protocol))
+          KubernetesAppReport(driver, Seq.empty, IndexedSeq.empty, Left(ingress), livyConf(protocol))
             .getTrackingUrl.isDefined
         }
       }
@@ -152,11 +188,11 @@ class SparkKubernetesAppSpec extends FunSpec with LivyBaseUnitTestSuite {
 
       assertResult(s"${protocol.get}://${hostname.get}/app_tag") {
         KubernetesAppReport(driverMock(true), Seq.empty, IndexedSeq.empty,
-          Some(ingressMock(hostname)), livyConf(protocol)).getTrackingUrl.get
+          Left(Some(ingressMock(hostname))), livyConf(protocol)).getTrackingUrl.get
       }
       assertResult(s"${protocol.get}://${hostname.get}/unknown") {
         KubernetesAppReport(driverMock(false), Seq.empty, IndexedSeq.empty,
-          Some(ingressMock(hostname)), livyConf(protocol)).getTrackingUrl.get
+          Left(Some(ingressMock(hostname))), livyConf(protocol)).getTrackingUrl.get
       }
     }
 

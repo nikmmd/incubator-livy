@@ -19,7 +19,6 @@ package org.apache.livy.utils
 import java.net.URLEncoder
 import java.util.Collections
 import java.util.concurrent.TimeoutException
-
 import scala.annotation.tailrec
 import scala.collection.mutable.ArrayBuffer
 import scala.concurrent._
@@ -27,12 +26,10 @@ import scala.concurrent.duration._
 import scala.language.postfixOps
 import scala.util.{Failure, Success, Try}
 import scala.util.control.NonFatal
-
-import io.fabric8.kubernetes.api.model._
+import io.fabric8.kubernetes.api.model.{HasMetadata, OwnerReferenceBuilder, Pod, Service, ServiceBuilder, ServicePort}
 import io.fabric8.kubernetes.api.model.extensions.{Ingress, IngressBuilder}
 import io.fabric8.kubernetes.client.{ConfigBuilder, _}
 import org.apache.commons.lang.StringUtils
-
 import org.apache.livy.{LivyConf, Logging, Utils}
 
 object SparkKubernetesApp extends Logging {
@@ -154,6 +151,7 @@ class SparkKubernetesApp private[utils] (
       listener.foreach(_.appIdKnown(appId))
 
       if (livyConf.getBoolean(LivyConf.KUBERNETES_INGRESS_CREATE)) {
+        logger.debug("Building Spark UI Ingress")
         withRetry(kubernetesClient.createSparkUIIngress(app, livyConf))
       }
 
@@ -336,7 +334,7 @@ class KubernetesApplication(driverPod: Pod) {
 }
 
 private[utils] case class KubernetesAppReport(driver: Option[Pod], executors: Seq[Pod],
-  appLog: IndexedSeq[String], ingress: Option[Ingress], livyConf: LivyConf) {
+  appLog: IndexedSeq[String], endpoint: Either[Option[Ingress], Option[Service]], livyConf: LivyConf) {
 
   import KubernetesConstants._
 
@@ -391,12 +389,27 @@ private[utils] case class KubernetesAppReport(driver: Option[Pod], executors: Se
   }
 
   def getTrackingUrl: Option[String] = {
-    val host = ingress.flatMap(i => Try(i.getSpec.getRules.get(0).getHost).toOption)
-    val path = driver
-      .map(_.getMetadata.getLabels.getOrDefault(SPARK_APP_TAG_LABEL, "unknown"))
-    val protocol = livyConf.get(LivyConf.KUBERNETES_INGRESS_PROTOCOL)
-    if (host.isDefined && path.isDefined) Some(s"$protocol://${host.get}/${path.get}")
-    else None
+    import scala.collection.JavaConverters._
+
+     endpoint match {
+      case Left(ing) =>
+            val host = ing.flatMap(i => Try(i.getSpec.getRules.get(0).getHost).toOption)
+            val path = driver
+              .map(_.getMetadata.getLabels.getOrDefault(SPARK_APP_TAG_LABEL, "unknown"))
+            val protocol = livyConf.get(LivyConf.KUBERNETES_INGRESS_PROTOCOL)
+            if (host.isDefined && path.isDefined) Some(s"$protocol://${host.get}/${path.get}")
+            else None
+
+      case Right(svc) =>
+            val svcName = svc.get.getMetadata.getName
+            val namespace = svc.get.getMetadata.getNamespace
+
+            val sparkUIPort = svc.get.getSpec.getPorts.asScala.filter(p => p.getName == "spark-ui").headOption
+            val protocol = livyConf.get(LivyConf.KUBERNETES_INGRESS_PROTOCOL)
+            // TODO: Should probably support external dns if needed
+            if(!svcName.isEmpty && sparkUIPort.isDefined) Some(s"${protocol}://${svcName}.${namespace}.svc.cluster.local:${sparkUIPort.get.getPort}")
+            else None
+     }
   }
 
   def getApplicationDiagnostics: IndexedSeq[String] = {
@@ -491,10 +504,27 @@ private[utils] object KubernetesExtensions {
           .withName(app.getApplicationPod.getMetadata.getName)
           .tailingLines(cacheLogSize).getLog.split("\n").toIndexedSeq
       ).getOrElse(IndexedSeq.empty)
-      val ingress = client.extensions.ingresses.inNamespace(app.getApplicationNamespace)
-        .withLabel(SPARK_APP_TAG_LABEL, app.getApplicationTag)
-        .list.getItems.asScala.headOption
-      KubernetesAppReport(driver, executors, appLog, ingress, livyConf)
+
+
+      val endpoint: Either[Option[Ingress], Option[Service]] = if(livyConf.getBoolean(LivyConf.KUBERNETES_INGRESS_CREATE)){
+        val ingress = client.extensions.ingresses.inNamespace(app.getApplicationNamespace)
+          .withLabel(SPARK_APP_TAG_LABEL, app.getApplicationTag)
+          .list.getItems.asScala.headOption
+
+        Left(ingress)
+      }else{
+
+        val driverInternalService = client.services
+          .inNamespace(app.getApplicationNamespace)
+          .withLabel(SPARK_APP_TAG_LABEL, app.getApplicationTag)
+          .withLabel(SPARK_ROLE_LABEL, SPARK_ROLE_DRIVER).list.getItems.asScala.headOption
+
+
+        Right(driverInternalService)
+      }
+
+
+      KubernetesAppReport(driver, executors, appLog, endpoint, livyConf)
     }
 
     def createSparkUIIngress(app: KubernetesApplication, livyConf: LivyConf): Unit = {
